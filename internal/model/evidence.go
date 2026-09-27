@@ -21,6 +21,9 @@ type Evidence struct {
     Value float64 `json:"value"`
     RecordedAt time.Time `json:"recorded_at"`
     Durable bool `json:"durable"`
+    // Batch names the sampling batch the sample belongs to. Empty means the
+    // sample is not part of any synchronized batch.
+    Batch string `json:"batch,omitempty"`
 }
 
 type DeviceCommand struct {
@@ -54,6 +57,11 @@ func NewEvidence(run RunID, revision RevisionID, source string, kind EvidenceKin
 
 func (e Evidence) WithDurability(durable bool) Evidence {
     e.Durable = durable
+    return e
+}
+
+func (e Evidence) WithBatch(batch string) Evidence {
+    e.Batch = batch
     return e
 }
 

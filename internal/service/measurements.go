@@ -19,8 +19,10 @@ import (
 // MeasuredRun contains observations supplied by an operator, unlike the
 // deterministic diagnostic scenario used by the legacy equipment page.
 type MeasuredRun struct {
-	Operation model.Operation  `json:"operation"`
-	Evidence  []model.Evidence `json:"evidence"`
+	Operation model.Operation           `json:"operation"`
+	Evidence  []model.Evidence          `json:"evidence"`
+	Layout    probe.Layout              `json:"layout,omitempty"`
+	TimeBases map[string]probe.TimeBase `json:"time_bases,omitempty"`
 }
 
 type MeasurementInput struct {
@@ -28,14 +30,16 @@ type MeasurementInput struct {
 	SourceID   string             `json:"source_id"`
 	Value      float64            `json:"value"`
 	RecordedAt time.Time          `json:"recorded_at"`
+	Batch      string             `json:"batch,omitempty"`
 }
 
 type MeasurementAnalysis struct {
-	Operation  model.Operation `json:"operation"`
-	Wave       probe.Analysis  `json:"wave"`
-	ForceCount int             `json:"force_count"`
-	ForceMean  float64         `json:"force_mean"`
-	Evaluated  time.Time       `json:"evaluated_at"`
+	Operation   model.Operation   `json:"operation"`
+	Wave        probe.Analysis    `json:"wave"`
+	Propagation probe.Propagation `json:"propagation"`
+	ForceCount  int               `json:"force_count"`
+	ForceMean   float64           `json:"force_mean"`
+	Evaluated   time.Time         `json:"evaluated_at"`
 }
 
 type MeasurementArchive struct {
@@ -71,6 +75,14 @@ func OpenMeasurementArchive(directory string) (*MeasurementArchive, error) {
 
 func cloneMeasuredRun(value MeasuredRun) MeasuredRun {
 	value.Evidence = append([]model.Evidence(nil), value.Evidence...)
+	value.Layout.Probes = append([]probe.Installation(nil), value.Layout.Probes...)
+	if value.TimeBases != nil {
+		bases := make(map[string]probe.TimeBase, len(value.TimeBases))
+		for batch, base := range value.TimeBases {
+			bases[batch] = base
+		}
+		value.TimeBases = bases
+	}
 	return value
 }
 
@@ -136,7 +148,7 @@ func (a *MeasurementArchive) Record(id model.RunID, input MeasurementInput) (mod
 	if !exists {
 		return model.Evidence{}, errors.New("run not found")
 	}
-	evidence := model.NewEvidence(id, run.Operation.Revision, input.SourceID, input.Kind, input.Value, input.RecordedAt).WithDurability(a.path != "")
+	evidence := model.NewEvidence(id, run.Operation.Revision, input.SourceID, input.Kind, input.Value, input.RecordedAt).WithDurability(a.path != "").WithBatch(strings.TrimSpace(input.Batch))
 	run = cloneMeasuredRun(run)
 	run.Evidence = append(run.Evidence, evidence)
 	next := make(map[model.RunID]MeasuredRun, len(a.runs))
@@ -148,6 +160,84 @@ func (a *MeasurementArchive) Record(id model.RunID, input MeasurementInput) (mod
 		return model.Evidence{}, err
 	}
 	return evidence, nil
+}
+
+// SetProbeLayout replaces the probe installation coordinates of a run. The
+// flume length is optional and only bounds the uncovered region reporting.
+func (a *MeasurementArchive) SetProbeLayout(id model.RunID, layout probe.Layout) (MeasuredRun, error) {
+	probes := make([]probe.Installation, 0, len(layout.Probes))
+	seen := make(map[string]struct{}, len(layout.Probes))
+	for _, installation := range layout.Probes {
+		source := strings.TrimSpace(installation.SourceID)
+		if source == "" || math.IsNaN(installation.Position) || math.IsInf(installation.Position, 0) || installation.Position < 0 {
+			return MeasuredRun{}, errors.New("probe source and finite non-negative position are required")
+		}
+		if _, duplicate := seen[source]; duplicate {
+			return MeasuredRun{}, errors.New("probe sources must be unique")
+		}
+		seen[source] = struct{}{}
+		probes = append(probes, probe.Installation{SourceID: source, Position: installation.Position})
+	}
+	if math.IsNaN(layout.FlumeLength) || math.IsInf(layout.FlumeLength, 0) || layout.FlumeLength < 0 {
+		return MeasuredRun{}, errors.New("flume length must be finite and non-negative")
+	}
+	if layout.FlumeLength > 0 {
+		for _, installation := range probes {
+			if installation.Position > layout.FlumeLength {
+				return MeasuredRun{}, errors.New("probe position beyond flume length")
+			}
+		}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	run, exists := a.runs[id]
+	if !exists {
+		return MeasuredRun{}, errors.New("run not found")
+	}
+	run = cloneMeasuredRun(run)
+	run.Layout = probe.Layout{Probes: probes, FlumeLength: layout.FlumeLength}
+	next := make(map[model.RunID]MeasuredRun, len(a.runs))
+	for key, value := range a.runs {
+		next[key] = value
+	}
+	next[id] = run
+	if err := a.commit(next); err != nil {
+		return MeasuredRun{}, err
+	}
+	return run, nil
+}
+
+// SetBatchTimeBase marks one sampling batch as confirmed or unknown. Batches
+// stay unknown until explicitly confirmed, so unverifiable samples never
+// enter the propagation mapping.
+func (a *MeasurementArchive) SetBatchTimeBase(id model.RunID, batch string, timeBase probe.TimeBase) (MeasuredRun, error) {
+	batch = strings.TrimSpace(batch)
+	if batch == "" {
+		return MeasuredRun{}, errors.New("batch is required")
+	}
+	if timeBase != probe.TimeBaseConfirmed && timeBase != probe.TimeBaseUnknown {
+		return MeasuredRun{}, errors.New("time base must be confirmed or unknown")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	run, exists := a.runs[id]
+	if !exists {
+		return MeasuredRun{}, errors.New("run not found")
+	}
+	run = cloneMeasuredRun(run)
+	if run.TimeBases == nil {
+		run.TimeBases = make(map[string]probe.TimeBase)
+	}
+	run.TimeBases[batch] = timeBase
+	next := make(map[model.RunID]MeasuredRun, len(a.runs))
+	for key, value := range a.runs {
+		next[key] = value
+	}
+	next[id] = run
+	if err := a.commit(next); err != nil {
+		return MeasuredRun{}, err
+	}
+	return run, nil
 }
 
 func (a *MeasurementArchive) Get(id model.RunID) (MeasuredRun, bool) {
@@ -184,6 +274,7 @@ func (a *MeasurementArchive) Analyze(id model.RunID) (MeasurementAnalysis, error
 		}
 	}
 	result.Wave = probe.Analyze(waves)
+	result.Propagation = probe.AnalyzePropagation(waves, run.Layout, run.TimeBases)
 	if result.ForceCount > 0 {
 		result.ForceMean /= float64(result.ForceCount)
 	}
@@ -196,6 +287,14 @@ func (r *Runtime) CreateMeasuredRun(name, modelName, section, carriage string) (
 
 func (r *Runtime) RecordMeasurement(id model.RunID, input MeasurementInput) (model.Evidence, error) {
 	return r.Measurements.Record(id, input)
+}
+
+func (r *Runtime) SetProbeLayout(id model.RunID, layout probe.Layout) (MeasuredRun, error) {
+	return r.Measurements.SetProbeLayout(id, layout)
+}
+
+func (r *Runtime) SetBatchTimeBase(id model.RunID, batch string, timeBase probe.TimeBase) (MeasuredRun, error) {
+	return r.Measurements.SetBatchTimeBase(id, batch, timeBase)
 }
 
 func (r *Runtime) MeasuredRuns() []MeasuredRun { return r.Measurements.List() }
